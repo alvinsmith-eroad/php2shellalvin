@@ -60,7 +60,7 @@ A second use-after-free exists in PHP's SAPI-level multipart parser, independent
 
 ## 9-Chain Architecture
 
-The v4.1 exploit implements **9 independent RCE chains**, each exploiting different conditions. This multi-vector approach maximizes success rate across diverse target configurations.
+The v5.0 exploit implements **9 independent RCE chains**, each exploiting different conditions. This multi-vector approach maximizes success rate across diverse target configurations.
 
 | Chain | Name | Requirements | LFI Needed | Reliability |
 |---|---|---|---|---|
@@ -119,7 +119,7 @@ Chain 2 uses the PHP session serializer pipe `|` delimiter to inject serialized 
 | **Laravel/RCE1** | Laravel | 5.4+ (PHP 7.x) | PendingBroadcast → Events\Dispatcher |
 | **Laravel/RCE2** | Laravel | 5.6-9.x (PHP 7.x) | PendingBroadcast → Bus\Dispatcher |
 | **Monolog/RCE** | Monolog | 1.18-2.x | BufferHandler → StreamHandler |
-| **Guzzle/RCE** | Guzzle | 6.0-6.3.2 | FnStream → _fn_close |
+| **Guzzle/Info** | Guzzle | 6.0-6.3.2 | FnStream → _fn_close (detection) |
 | **Symfony/RCE** | Symfony | 3.x-5.x | Process → commandline |
 
 ---
@@ -140,9 +140,10 @@ php2shell/
 │   ├── index.php              # Configuration verification (phpinfo)
 │   ├── upload.php             # Multipart upload endpoint
 │   ├── view.php               # Intentional LFI vulnerability
-│   └── debug.php              # Session file inspector
+│   ├── debug.php              # Session file inspector
+│   └── session.php            # Session-enabled page (Chain 2/9 testing)
 ├── exploit/
-│   ├── php2shell.py           # Main RCE exploit (8-chain, v4.0)
+│   ├── php2shell.py           # Main RCE exploit (9-chain, v5.0)
 │   ├── uaf_probe.py           # Multipart parser UAF crash probe
 │   └── requirements.txt       # Python dependencies
 └── scripts/
